@@ -1,0 +1,15 @@
+{
+    "name": "@unbound-app/hermesc",
+    "version": "1.0.1",
+    "private": false,
+    "description": "Hermes compiler binaries",
+    "license": "MIT",
+    "files": [
+        "linux/hermesc",
+        "darwin/hermesc",
+        "win32/hermesc.exe",
+        "win32/msvcp140.dll",
+        "win32/vcruntime140.dll",
+        "win32/vcruntime140_1.dll"
+    ]
+}

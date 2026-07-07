@@ -1,0 +1,218 @@
+name: Compile Hermesc Package
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. Lean cadence; upstream bytecode bumps are infrequent.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      release:
+        type: boolean
+        description: Publish release to NPM
+        default: false
+      version:
+        type: string
+        description: 'Package version override (defaults to "<bytecode version>.0.0")'
+        required: false
+
+env:
+  # Upstream build source of truth. Checked out fresh each run, never merged into this repo.
+  HERMES_REPO: facebook/hermes
+  HERMES_REF: main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      package_version: ${{ steps.decide.outputs.package_version }}
+      bytecode_version: ${{ steps.decide.outputs.bytecode_version }}
+
+    steps:
+      - name: Read upstream bytecode version
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: ${{ env.HERMES_REF }}
+          sparse-checkout: include/hermes/BCGen/HBC/BytecodeVersion.h
+          sparse-checkout-cone-mode: false
+
+      # Our decision script lives in this repo, not upstream; check it out alongside.
+      - uses: actions/checkout@v4
+        with:
+          path: .hermesc-ci
+          sparse-checkout: npm/hermesc/decide-version.js
+          sparse-checkout-cone-mode: false
+
+      # No setup-node: the decision script is dependency-free stdlib, and the
+      # runner ships node + npm. Skipping it keeps this preflight job fast.
+      - name: Decide whether to build
+        id: decide
+        # Untrusted inputs pass through env, never ${{ }} interpolation into the script body, to avoid injection.
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
+        run: |
+          BYTECODE_VERSION=$(grep -oP 'BYTECODE_VERSION\s*=\s*\K[0-9]+' include/hermes/BCGen/HBC/BytecodeVersion.h)
+          if [ -z "$BYTECODE_VERSION" ]; then
+            echo "::error::Could not read BYTECODE_VERSION from upstream include/hermes/BCGen/HBC/BytecodeVersion.h"
+            exit 1
+          fi
+
+          EXISTING=$(npm view @unbound-app/hermesc versions --json 2>/dev/null || echo '[]')
+          echo "$EXISTING" | BYTECODE_VERSION="$BYTECODE_VERSION" node .hermesc-ci/npm/hermesc/decide-version.js | tee -a "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: check
+    if: ${{ needs.check.outputs.should_build == 'true' }}
+    runs-on: "windows-2022"
+
+    steps:
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          key: windows
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: ${{ env.HERMES_REF }}
+      - name: Compile Hermesc for Windows
+        run: |
+          choco install ninja
+          cmake -S . -B build -G 'Visual Studio 17 2022' -DCMAKE_BUILD_TYPE=Release
+          cmake --build ./build --config Release --target hermesc
+          Copy-Item -Path "c:\windows\system32\msvcp140.dll" -Destination ".\build\bin\Release"
+          Copy-Item -Path "c:\windows\system32\vcruntime140.dll" -Destination ".\build\bin\Release"
+          Copy-Item -Path "c:\windows\system32\vcruntime140_1.dll" -Destination ".\build\bin\Release"
+      - uses: actions/upload-artifact@v4
+        name: Upload Windows Binaries
+        with:
+          name: hermesc-windows
+          path: |
+            build/bin/Release/hermesc.exe
+            build/bin/Release/vcruntime140_1.dll
+            build/bin/Release/vcruntime140.dll
+            build/bin/Release/msvcp140.dll
+
+  build-linux:
+    needs: check
+    if: ${{ needs.check.outputs.should_build == 'true' }}
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: ${{ env.HERMES_REF }}
+      - name: Compile Hermesc for Linux
+        run: |
+          sudo apt update
+          sudo apt install cmake git ninja-build libicu-dev zip libreadline-dev
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build ./build --config Release --target hermesc
+      - uses: actions/upload-artifact@v4
+        name: Upload Linux Binaries
+        with:
+          name: hermesc-linux
+          path: build/bin/hermesc
+
+  build-mac:
+    needs: check
+    if: ${{ needs.check.outputs.should_build == 'true' }}
+    runs-on: "macos-latest"
+
+    steps:
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: ${{ env.HERMES_REF }}
+      - name: Compile Hermesc for MacOS
+        run: |
+          brew install cmake git ninja
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build ./build --config Release --target hermesc
+      - uses: actions/upload-artifact@v4
+        name: Upload MacOS Binaries
+        with:
+          name: hermesc-mac
+          path: build/bin/hermesc
+
+  package:
+    runs-on: "ubuntu-latest"
+    needs: [check, build-windows, build-linux, build-mac]
+    permissions:
+      # OIDC token for npm trusted publishing (no NPM_TOKEN needed).
+      id-token: write
+      contents: read
+
+    steps:
+      # Overlay our npm manifest onto the upstream-built binaries.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: npm/hermesc/package.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermesc-linux
+          path: ./npm/hermesc/linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermesc-mac
+          path: ./npm/hermesc/darwin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermesc-windows
+          path: ./npm/hermesc/win32
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Make NPM Tarball
+        run: |
+          cd npm/hermesc
+          chmod +rx ./**/hermesc
+          npm pkg set version=${{ needs.check.outputs.package_version }}
+          npm pack
+
+      - uses: actions/upload-artifact@v4
+        name: Upload Hermesc Tarball
+        with:
+          name: hermesc-tarball
+          path: ./npm/hermesc/*.tgz
+
+      - name: NPM Publish
+        id: publish
+        # Manual dispatch opts in via release=true; scheduled cron always publishes new bytecode (PRD #4).
+        if: ${{ inputs.release == true || github.event_name == 'schedule' }}
+        # Authenticated via OIDC trusted publishing; requires npm >= 11.5.1 (node 24 ships it).
+        run: |
+          cd npm/hermesc
+          npm pkg set version=${{ needs.check.outputs.package_version }}
+          npm publish --access public
+
+      - name: Notify rollup-plugin of new release
+        if: ${{ steps.publish.outcome == 'success' }}
+        continue-on-error: true
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HERMESC_DISPATCH_TOKEN }}
+          repository: unbound-app/rollup-plugin-hermes
+          event-type: hermesc-published
+          client-payload: |-
+            {
+              "bytecodeVersion": "${{ needs.check.outputs.bytecode_version }}",
+              "packageVersion": "${{ needs.check.outputs.package_version }}"
+            }
