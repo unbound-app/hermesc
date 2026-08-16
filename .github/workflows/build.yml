@@ -14,11 +14,16 @@ on:
         type: string
         description: 'Package version override (defaults to "<bytecode version>.0.0")'
         required: false
+      hermes_ref:
+        type: string
+        description: Hermes source ref to compile
+        default: main
+        required: false
 
 env:
   # Upstream build source of truth. Checked out fresh each run, never merged into this repo.
   HERMES_REPO: facebook/hermes
-  HERMES_REF: main
+  HERMES_REF: ${{ inputs.hermes_ref || 'main' }}
 
 jobs:
   check:
