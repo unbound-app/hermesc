@@ -4,6 +4,7 @@
     "private": false,
     "description": "Hermes compiler binaries",
     "license": "MIT",
+    "repository": "https://github.com/unbound-app/hermesc",
     "files": [
         "linux/hermesc",
         "darwin/hermesc",
