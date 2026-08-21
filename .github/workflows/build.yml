@@ -156,7 +156,8 @@ jobs:
     permissions:
       # OIDC token for npm trusted publishing (no NPM_TOKEN needed).
       id-token: write
-      contents: read
+      # Commit the regenerated manifest.json back to the default branch.
+      contents: write
 
     steps:
       # Overlay our npm manifest onto the upstream-built binaries.
@@ -208,6 +209,26 @@ jobs:
           npm pkg set version=${{ needs.check.outputs.package_version }}
           npm publish --access public
 
+      # Regenerate the raw-GitHub manifest from live npm and commit it to the
+      # default branch only when it actually changed, so replayed/no-op runs
+      # don't churn history.
+      - name: Regenerate manifest
+        if: ${{ steps.publish.outcome == 'success' }}
+        run: |
+          git clone --depth 1 --branch main "https://github.com/${{ github.repository }}.git" manifest-repo
+          cd manifest-repo
+          node npm/hermesc/build-manifest.js
+          if git diff --quiet manifest.json; then
+            echo "manifest.json unchanged; nothing to commit."
+          else
+            git config user.name 'unbound-bot'
+            git config user.email 'unbound-bot@users.noreply.github.com'
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git add manifest.json
+            git commit -m 'chore: regenerate hermesc manifest'
+            git push origin main
+          fi
+
       - name: Notify rollup-plugin of new release
         if: ${{ steps.publish.outcome == 'success' }}
         continue-on-error: true
@@ -215,6 +236,20 @@ jobs:
         with:
           token: ${{ secrets.HERMESC_DISPATCH_TOKEN }}
           repository: unbound-app/rollup-plugin-hermes
+          event-type: hermesc-published
+          client-payload: |-
+            {
+              "bytecodeVersion": "${{ needs.check.outputs.bytecode_version }}",
+              "packageVersion": "${{ needs.check.outputs.package_version }}"
+            }
+
+      - name: Notify unbound of new release
+        if: ${{ steps.publish.outcome == 'success' }}
+        continue-on-error: true
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HERMESC_DISPATCH_TOKEN }}
+          repository: marioparaschiv/unbound
           event-type: hermesc-published
           client-payload: |-
             {
